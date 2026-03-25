@@ -3,6 +3,8 @@ const std = @import("std");
 const RNG_MULTIPLIER: u64 = 1103515245;
 const RNG_INCREMENT: u64 = 12345;
 
+const LANE_COUNT = std.simd.suggestVectorLength(f32) orelse 4;
+
 pub fn nextRng(seed: *u64) u64 {
     seed.* = seed.* *% RNG_MULTIPLIER +% RNG_INCREMENT;
     return seed.*;
@@ -98,18 +100,42 @@ pub fn rotate(
     return result;
 }
 
+inline fn rowDot(matrix_row: []const f32, input: []const f32, d: usize) f32 {
+    var sum_vec: @Vector(LANE_COUNT, f32) = @splat(0);
+
+    var col: usize = 0;
+    while (col + LANE_COUNT <= d) : (col += LANE_COUNT) {
+        const m: @Vector(LANE_COUNT, f32) = matrix_row[col..][0..LANE_COUNT].*;
+        const i: @Vector(LANE_COUNT, f32) = input[col..][0..LANE_COUNT].*;
+        sum_vec += m * i;
+    }
+
+    var total = @reduce(.Add, sum_vec);
+
+    while (col < d) : (col += 1) {
+        total += matrix_row[col] * input[col];
+    }
+    return total;
+}
+
 pub const RotationOperator = struct {
     dim: usize,
     seed: u32,
     matrix: []f32,
+    matrix_t: []f32,
 
     pub fn prepare(allocator: std.mem.Allocator, dim: usize, seed: u32) !RotationOperator {
         const matrix = try allocator.alloc(f32, dim * dim);
         errdefer allocator.free(matrix);
 
+        const matrix_t = try allocator.alloc(f32, dim * dim);
+        errdefer allocator.free(matrix_t);
+
         for (0..dim) |i| {
             for (0..dim) |j| {
-                matrix[i * dim + j] = gaussianCoeff(seed, i, j);
+                const coeff = gaussianCoeff(seed, i, j);
+                matrix[i * dim + j] = coeff;
+                matrix_t[j * dim + i] = coeff;
             }
         }
 
@@ -117,11 +143,13 @@ pub const RotationOperator = struct {
             .dim = dim,
             .seed = seed,
             .matrix = matrix,
+            .matrix_t = matrix_t,
         };
     }
 
     pub fn destroy(op: *RotationOperator, allocator: std.mem.Allocator) void {
         allocator.free(op.matrix);
+        allocator.free(op.matrix_t);
     }
 
     pub fn matVecMul(op: *const RotationOperator, input: []const f32, output: []f32) void {
@@ -129,11 +157,8 @@ pub const RotationOperator = struct {
         std.debug.assert(input.len == d and output.len == d);
 
         for (0..d) |i| {
-            var sum: f32 = 0;
-            for (0..d) |j| {
-                sum += op.matrix[i * d + j] * input[j];
-            }
-            output[i] = sum;
+            const row_start = i * d;
+            output[i] = rowDot(op.matrix[row_start..], input, d);
         }
     }
 
@@ -142,11 +167,8 @@ pub const RotationOperator = struct {
         std.debug.assert(input.len == d and output.len == d);
 
         for (0..d) |i| {
-            var sum: f32 = 0;
-            for (0..d) |j| {
-                sum += op.matrix[j * d + i] * input[j];
-            }
-            output[i] = sum;
+            const row_start = i * d;
+            output[i] = rowDot(op.matrix_t[row_start..], input, d);
         }
     }
 

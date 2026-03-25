@@ -1,52 +1,46 @@
 const std = @import("std");
 const turboquant = @import("turboquant.zig");
 
-const Operation = enum {
-    encode,
-    decode,
-    dot,
-    encode_prepared,
-    decode_prepared,
-    dot_prepared,
-};
-
-const ProfileConfig = struct {
-    op: Operation,
-    dim: usize,
-    iterations: usize,
-    seed: u32,
-};
-
 const ProfileError = error{
     MissingArgs,
     InvalidOp,
     InvalidDim,
     InvalidIterations,
     OddDimension,
-    OutOfMemory,
-    InvalidDimension,
 };
 
-fn parseArgs(args: [][:0]u8) ProfileError!ProfileConfig {
-    if (args.len < 3) {
-        return ProfileError.MissingArgs;
-    }
+const Operation = enum {
+    encode,
+    decode,
+    dot,
+};
 
-    const op_str = args[1];
-    const op: Operation = if (std.mem.eql(u8, op_str, "encode")) Operation.encode else if (std.mem.eql(u8, op_str, "decode")) Operation.decode else if (std.mem.eql(u8, op_str, "dot")) Operation.dot else if (std.mem.eql(u8, op_str, "encode_prepared")) Operation.encode_prepared else if (std.mem.eql(u8, op_str, "decode_prepared")) Operation.decode_prepared else if (std.mem.eql(u8, op_str, "dot_prepared")) Operation.dot_prepared else return ProfileError.InvalidOp;
+const Config = struct {
+    op: Operation,
+    dim: usize,
+    iterations: usize,
+    seed: u32,
+};
 
-    const dim = std.fmt.parseInt(usize, args[2], 10) catch {
+fn parseArgs(args: []const [:0]u8) ProfileError!Config {
+    if (args.len < 3) return ProfileError.MissingArgs;
+
+    const op_str = std.mem.sliceTo(args[1], 0);
+    const op: Operation = if (std.mem.eql(u8, op_str, "encode")) Operation.encode else if (std.mem.eql(u8, op_str, "decode")) Operation.decode else if (std.mem.eql(u8, op_str, "dot")) Operation.dot else return ProfileError.InvalidOp;
+
+    const dim_str = std.mem.sliceTo(args[2], 0);
+    const dim = std.fmt.parseInt(usize, dim_str, 10) catch {
         return ProfileError.InvalidDim;
     };
     if (dim == 0) return ProfileError.InvalidDim;
     if (dim % 2 != 0) return ProfileError.OddDimension;
 
-    const iterations = if (args.len > 3)
-        std.fmt.parseInt(usize, args[3], 10) catch {
+    const iterations: usize = if (args.len > 3) blk: {
+        const iter_str = std.mem.sliceTo(args[3], 0);
+        break :blk std.fmt.parseInt(usize, iter_str, 10) catch {
             return ProfileError.InvalidIterations;
-        }
-    else
-        1000;
+        };
+    } else 1000;
 
     return .{
         .op = op,
@@ -119,61 +113,6 @@ fn runDot(allocator: std.mem.Allocator, dim: usize, iterations: usize, seed: u32
     return checksum;
 }
 
-fn runEncodePrepared(allocator: std.mem.Allocator, dim: usize, iterations: usize, seed: u32) !f32 {
-    var ptq = try turboquant.PreparedTurboQuant.prepare(allocator, dim, seed);
-    defer ptq.destroy(allocator);
-
-    const data = try generateVector(allocator, dim, seed);
-    defer allocator.free(data);
-
-    var checksum: f32 = 0;
-    for (0..iterations) |_| {
-        const compressed = try ptq.encode(allocator, data);
-        for (compressed) |b| checksum += @as(f32, @floatFromInt(b));
-        allocator.free(compressed);
-    }
-    return checksum;
-}
-
-fn runDecodePrepared(allocator: std.mem.Allocator, dim: usize, iterations: usize, seed: u32) !f32 {
-    var ptq = try turboquant.PreparedTurboQuant.prepare(allocator, dim, seed);
-    defer ptq.destroy(allocator);
-
-    const data = try generateVector(allocator, dim, seed);
-    defer allocator.free(data);
-
-    const compressed = try ptq.encode(allocator, data);
-    defer allocator.free(compressed);
-
-    var checksum: f32 = 0;
-    for (0..iterations) |_| {
-        const decoded = try ptq.decode(allocator, compressed);
-        for (decoded) |v| checksum += v;
-        allocator.free(decoded);
-    }
-    return checksum;
-}
-
-fn runDotPrepared(allocator: std.mem.Allocator, dim: usize, iterations: usize, seed: u32) !f32 {
-    var ptq = try turboquant.PreparedTurboQuant.prepare(allocator, dim, seed);
-    defer ptq.destroy(allocator);
-
-    const data = try generateVector(allocator, dim, seed);
-    defer allocator.free(data);
-
-    const query = try generateVector(allocator, dim, seed + 1);
-    defer allocator.free(query);
-
-    const compressed = try ptq.encode(allocator, data);
-    defer allocator.free(compressed);
-
-    var checksum: f32 = 0;
-    for (0..iterations) |_| {
-        checksum += ptq.dot(query, compressed);
-    }
-    return checksum;
-}
-
 pub fn main() void {
     const args = std.process.argsAlloc(std.heap.page_allocator) catch {
         std.debug.print("error: out of memory parsing args\n", .{});
@@ -185,26 +124,28 @@ pub fn main() void {
         switch (err) {
             ProfileError.MissingArgs => {
                 std.debug.print("Usage: profile <op> <dim> [iterations]\n", .{});
-                std.debug.print("  op: encode, decode, dot, encode_prepared, decode_prepared, dot_prepared\n", .{});
+                std.debug.print("  op: encode, decode, dot\n", .{});
                 std.debug.print("  dim: vector dimension (must be even)\n", .{});
                 std.debug.print("  iterations: default 1000\n", .{});
             },
             ProfileError.InvalidOp => {
-                std.debug.print("error: invalid operation '{s}'\n", .{args[1]});
+                std.debug.print("error: invalid operation '{s}'\n", .{std.mem.sliceTo(args[1], 0)});
             },
             ProfileError.InvalidDim => {
-                std.debug.print("error: invalid dimension '{s}'\n", .{args[2]});
+                std.debug.print("error: invalid dimension '{s}'\n", .{std.mem.sliceTo(args[2], 0)});
             },
             ProfileError.InvalidIterations => {
-                std.debug.print("error: invalid iterations '{s}'\n", .{args[3]});
+                std.debug.print("error: invalid iterations '{s}'\n", .{std.mem.sliceTo(args[3], 0)});
             },
             ProfileError.OddDimension => {
                 std.debug.print("error: dimension must be even\n", .{});
             },
-            else => {
-                std.debug.print("error: {}\n", .{err});
-            },
         }
+        return;
+    };
+
+    var timer = std.time.Timer.start() catch {
+        std.debug.print("error: could not start timer\n", .{});
         return;
     };
 
@@ -221,19 +162,12 @@ pub fn main() void {
             std.debug.print("dot error: {}\n", .{err});
             return;
         },
-        .encode_prepared => runEncodePrepared(std.heap.page_allocator, config.dim, config.iterations, config.seed) catch |err| {
-            std.debug.print("encode_prepared error: {}\n", .{err});
-            return;
-        },
-        .decode_prepared => runDecodePrepared(std.heap.page_allocator, config.dim, config.iterations, config.seed) catch |err| {
-            std.debug.print("decode_prepared error: {}\n", .{err});
-            return;
-        },
-        .dot_prepared => runDotPrepared(std.heap.page_allocator, config.dim, config.iterations, config.seed) catch |err| {
-            std.debug.print("dot_prepared error: {}\n", .{err});
-            return;
-        },
     };
 
+    const elapsed_ns = timer.read();
+    const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
+    const per_op_us = elapsed_ms * 1000.0 / @as(f64, @floatFromInt(config.iterations));
+
     std.debug.print("checksum: {e}\n", .{result});
+    std.debug.print("time: {d:.2}ms total, {d:.2}us/op ({d} iterations)\n", .{ elapsed_ms, per_op_us, config.iterations });
 }

@@ -16,82 +16,182 @@ pub const Options = struct {
     seed: u32 = DEFAULT_SEED,
 };
 
+const Engine = struct {
+    dim: usize,
+    seed: u32,
+    rot_op: rotation.RotationOperator,
+    qjl_workspace: qjl.Workspace,
+    scratch_rotated: []f32,
+    scratch_residual: []f32,
+    scratch_polar_decoded: []f32,
+    scratch_qjl_decoded: []f32,
+
+    fn init(allocator: std.mem.Allocator, dim: usize, seed: u32) !Engine {
+        var rot_op = try rotation.RotationOperator.prepare(allocator, dim, seed);
+        errdefer rot_op.destroy(allocator);
+
+        var qjl_workspace = try qjl.Workspace.init(allocator, dim);
+        errdefer qjl_workspace.deinit(allocator);
+
+        const scratch_rotated = try allocator.alloc(f32, dim);
+        errdefer allocator.free(scratch_rotated);
+
+        const scratch_residual = try allocator.alloc(f32, dim);
+        errdefer allocator.free(scratch_residual);
+
+        const scratch_polar_decoded = try allocator.alloc(f32, dim);
+        errdefer allocator.free(scratch_polar_decoded);
+
+        const scratch_qjl_decoded = try allocator.alloc(f32, dim);
+        errdefer allocator.free(scratch_qjl_decoded);
+
+        return .{
+            .dim = dim,
+            .seed = seed,
+            .rot_op = rot_op,
+            .qjl_workspace = qjl_workspace,
+            .scratch_rotated = scratch_rotated,
+            .scratch_residual = scratch_residual,
+            .scratch_polar_decoded = scratch_polar_decoded,
+            .scratch_qjl_decoded = scratch_qjl_decoded,
+        };
+    }
+
+    fn deinit(e: *Engine, allocator: std.mem.Allocator) void {
+        e.rot_op.destroy(allocator);
+        e.qjl_workspace.deinit(allocator);
+        allocator.free(e.scratch_rotated);
+        allocator.free(e.scratch_residual);
+        allocator.free(e.scratch_polar_decoded);
+        allocator.free(e.scratch_qjl_decoded);
+        e.* = undefined;
+    }
+
+    fn encode(e: *Engine, allocator: std.mem.Allocator, x: []const f32) ![]u8 {
+        const dim = e.dim;
+
+        e.rot_op.rotate(x, e.scratch_rotated);
+
+        var max_r: f32 = 0;
+        for (0..dim / 2) |i| {
+            const r = math.norm(e.scratch_rotated[i * 2 .. i * 2 + 2]);
+            if (r > max_r) max_r = r;
+        }
+        if (max_r == 0) max_r = 1.0;
+
+        const polar_encoded = try polar.encode(allocator, e.scratch_rotated, max_r);
+        errdefer allocator.free(polar_encoded);
+
+        computeResidualFromPolar(polar_encoded, e.scratch_rotated, max_r, e.scratch_residual);
+
+        const gamma = math.norm(e.scratch_residual);
+        const qjl_encoded = try qjl.encodeWithWorkspace(allocator, e.scratch_residual, &e.rot_op, &e.qjl_workspace);
+        errdefer allocator.free(qjl_encoded);
+
+        const polar_bytes = @as(u32, @intCast(polar_encoded.len));
+        const qjl_bytes = @as(u32, @intCast(qjl_encoded.len));
+        const total_size = format.HEADER_SIZE + polar_encoded.len + qjl_encoded.len;
+
+        const result = try allocator.alloc(u8, total_size);
+        errdefer allocator.free(result);
+
+        format.writeHeader(result, @intCast(dim), polar_bytes, qjl_bytes, max_r, gamma);
+        @memcpy(result[format.HEADER_SIZE..][0..polar_encoded.len], polar_encoded);
+        @memcpy(result[format.HEADER_SIZE + polar_encoded.len ..], qjl_encoded);
+        allocator.free(polar_encoded);
+        allocator.free(qjl_encoded);
+
+        return result;
+    }
+
+    fn decode(e: *Engine, allocator: std.mem.Allocator, compressed: []const u8) ![]f32 {
+        const header = try format.readHeader(compressed);
+        const payload = try format.slicePayload(compressed, header);
+
+        const polar_decoded = try polar.decode(allocator, payload.polar, header.dim, header.max_r);
+        errdefer allocator.free(polar_decoded);
+
+        qjl.decodeInto(e.scratch_qjl_decoded, payload.qjl, header.gamma, &e.rot_op, &e.qjl_workspace);
+
+        math.addInPlace(polar_decoded, e.scratch_qjl_decoded);
+
+        return polar_decoded;
+    }
+
+    fn dot(e: *Engine, q: []const f32, compressed: []const u8) f32 {
+        const header = format.readHeader(compressed) catch return 0;
+        if (q.len != header.dim) return 0;
+
+        const payload = format.slicePayload(compressed, header) catch return 0;
+
+        const polar_sum = polar.dotProduct(q, payload.polar, header.max_r);
+        const qjl_sum = qjl.estimateDotWithWorkspace(q, payload.qjl, header.gamma, &e.rot_op, &e.qjl_workspace);
+
+        return polar_sum + qjl_sum;
+    }
+};
+
 pub fn encode(allocator: std.mem.Allocator, x: []const f32, opts: Options) EncodeError![]u8 {
     const dim = x.len;
     if (dim == 0 or dim % 2 != 0) return EncodeError.InvalidDimension;
 
-    var rot_op = try rotation.RotationOperator.prepare(allocator, dim, opts.seed);
-    defer rot_op.destroy(allocator);
+    var engine = try Engine.init(allocator, dim, opts.seed);
+    defer engine.deinit(allocator);
 
-    const rotated = try allocator.alloc(f32, dim);
-    defer allocator.free(rotated);
-    rot_op.rotate(x, rotated);
-
-    var max_r: f32 = 0;
-    for (0..dim / 2) |i| {
-        const r = math.norm(rotated[i * 2 .. i * 2 + 2]);
-        if (r > max_r) max_r = r;
-    }
-    if (max_r == 0) max_r = 1.0;
-
-    const polar_encoded = try polar.encode(allocator, rotated, max_r);
-    defer allocator.free(polar_encoded);
-
-    const polar_decoded = try polar.decode(allocator, polar_encoded, dim, max_r);
-    defer allocator.free(polar_decoded);
-
-    const residual = try allocator.alloc(f32, dim);
-    defer allocator.free(residual);
-    math.sub(rotated, polar_decoded, residual);
-
-    const gamma = math.norm(residual);
-    const qjl_encoded = try qjl.encode(allocator, residual, opts.seed);
-    defer allocator.free(qjl_encoded);
-
-    const polar_bytes = @as(u32, @intCast(polar_encoded.len));
-    const qjl_bytes = @as(u32, @intCast(qjl_encoded.len));
-    const total_size = format.HEADER_SIZE + polar_encoded.len + qjl_encoded.len;
-
-    const result = try allocator.alloc(u8, total_size);
-    errdefer allocator.free(result);
-
-    format.writeHeader(result, @intCast(dim), polar_bytes, qjl_bytes, max_r, gamma);
-    @memcpy(result[format.HEADER_SIZE..][0..polar_encoded.len], polar_encoded);
-    @memcpy(result[format.HEADER_SIZE + polar_encoded.len ..], qjl_encoded);
-
-    const bpd = (total_size - format.HEADER_SIZE) * 8 / dim;
-    log.debug("encoded: dim={}, bytes={}, bits/dim={}", .{ dim, total_size, bpd });
+    const result = try engine.encode(allocator, x);
+    const bpd = (result.len - format.HEADER_SIZE) * 8 / dim;
+    log.debug("encoded: dim={}, bytes={}, bits/dim={}", .{ dim, result.len, bpd });
 
     return result;
 }
 
 pub fn decode(allocator: std.mem.Allocator, compressed: []const u8, seed: u32) DecodeError![]f32 {
-    const header = try format.readHeader(compressed);
+    const header = format.readHeader(compressed) catch |err| switch (err) {
+        error.InvalidHeader => return DecodeError.InvalidHeader,
+        error.OutOfMemory => return DecodeError.OutOfMemory,
+        error.InvalidPayload => return DecodeError.InvalidPayload,
+    };
+    const dim = header.dim;
 
-    const payload = try format.slicePayload(compressed, header);
+    const payload = format.slicePayload(compressed, header) catch |err| switch (err) {
+        error.InvalidHeader => return DecodeError.InvalidHeader,
+        error.OutOfMemory => return DecodeError.OutOfMemory,
+        error.InvalidPayload => return DecodeError.InvalidPayload,
+    };
 
-    const polar_decoded = polar.decode(allocator, payload.polar, header.dim, header.max_r) catch |err| {
-        return switch (err) {
-            error.InvalidDimension => DecodeError.InvalidPayload,
-            error.OutOfMemory => DecodeError.OutOfMemory,
-        };
+    var engine = Engine.init(allocator, dim, seed) catch |err| switch (err) {
+        error.OutOfMemory => return DecodeError.OutOfMemory,
+    };
+    errdefer engine.deinit(allocator);
+
+    const polar_decoded = polar.decode(allocator, payload.polar, dim, header.max_r) catch |err| switch (err) {
+        error.InvalidDimension => return DecodeError.InvalidPayload,
+        error.OutOfMemory => return DecodeError.OutOfMemory,
     };
     errdefer allocator.free(polar_decoded);
 
-    const qjl_decoded = qjl.decode(allocator, payload.qjl, header.gamma, header.dim, seed) catch |err| {
-        allocator.free(polar_decoded);
-        return switch (err) {
-            error.InvalidDimension => DecodeError.InvalidPayload,
-            error.OutOfMemory => DecodeError.OutOfMemory,
-        };
-    };
+    qjl.decodeInto(engine.scratch_qjl_decoded, payload.qjl, header.gamma, &engine.rot_op, &engine.qjl_workspace);
 
-    for (polar_decoded, qjl_decoded) |*p, q| {
-        p.* += q;
-    }
-    allocator.free(qjl_decoded);
+    math.addInPlace(polar_decoded, engine.scratch_qjl_decoded);
 
     return polar_decoded;
+}
+
+pub fn dot(q: []const f32, compressed: []const u8, seed: u32) f32 {
+    const header = format.readHeader(compressed) catch return 0;
+    const dim = header.dim;
+
+    if (q.len != dim) return 0;
+
+    const payload = format.slicePayload(compressed, header) catch return 0;
+
+    var engine = Engine.init(std.heap.page_allocator, dim, seed) catch return 0;
+    defer engine.deinit(std.heap.page_allocator);
+
+    const polar_sum = polar.dotProduct(q, payload.polar, header.max_r);
+    const qjl_sum = qjl.estimateDotWithWorkspace(q, payload.qjl, header.gamma, &engine.rot_op, &engine.qjl_workspace);
+
+    return polar_sum + qjl_sum;
 }
 
 fn computeResidualFromPolar(polar_encoded: []const u8, rotated: []const f32, max_r: f32, residual: []f32) void {
@@ -119,18 +219,6 @@ fn computeResidualFromPolar(polar_encoded: []const u8, rotated: []const f32, max
         residual[i * 2] = rotated[i * 2] - dx;
         residual[i * 2 + 1] = rotated[i * 2 + 1] - dy;
     }
-}
-
-pub fn dot(q: []const f32, compressed: []const u8, seed: u32) f32 {
-    const header = format.readHeader(compressed) catch return 0;
-    if (q.len != header.dim) return 0;
-
-    const payload = format.slicePayload(compressed, header) catch return 0;
-
-    const polar_sum = polar.dotProduct(q, payload.polar, header.max_r);
-    const qjl_sum = qjl.estimateDot(q, payload.qjl, header.gamma, seed);
-
-    return polar_sum + qjl_sum;
 }
 
 test "roundtrip" {
@@ -451,224 +539,3 @@ test "compression breakdown" {
         std.debug.print("dim={}: header={}, polar~={}, qjl~={}, expected={}, actual={}, overhead={}\n", .{ dim, header, polar_expected, qjl_expected, total_expected, total_actual, overhead });
     }
 }
-
-test "profile encode 512" {
-    const dim: usize = 512;
-    const iterations: usize = 100;
-    const seed: u32 = 12345;
-
-    var data: [4096]f32 = undefined;
-    var rng = std.Random.DefaultPrng.init(seed);
-    const r = rng.random();
-    for (0..dim) |i| {
-        data[i] = r.float(f32) * 10 - 5;
-    }
-
-    var checksum: f32 = 0;
-    for (0..iterations) |_| {
-        const compressed = encode(std.testing.allocator, data[0..dim], .{ .seed = seed }) catch unreachable;
-        for (compressed) |b| checksum += @as(f32, @floatFromInt(b));
-        std.testing.allocator.free(compressed);
-    }
-    std.debug.print("profile encode 512 checksum: {e}\n", .{checksum});
-}
-
-test "profile encode 1024" {
-    const dim: usize = 1024;
-    const iterations: usize = 50;
-    const seed: u32 = 12345;
-
-    var data: [4096]f32 = undefined;
-    var rng = std.Random.DefaultPrng.init(seed);
-    const r = rng.random();
-    for (0..dim) |i| {
-        data[i] = r.float(f32) * 10 - 5;
-    }
-
-    var checksum: f32 = 0;
-    for (0..iterations) |_| {
-        const compressed = encode(std.testing.allocator, data[0..dim], .{ .seed = seed }) catch unreachable;
-        for (compressed) |b| checksum += @as(f32, @floatFromInt(b));
-        std.testing.allocator.free(compressed);
-    }
-    std.debug.print("profile encode 1024 checksum: {e}\n", .{checksum});
-}
-
-test "profile dot 512" {
-    const dim: usize = 512;
-    const iterations: usize = 1000;
-    const seed: u32 = 12345;
-
-    var data: [4096]f32 = undefined;
-    var query: [4096]f32 = undefined;
-    var rng = std.Random.DefaultPrng.init(seed);
-    const r = rng.random();
-    for (0..dim) |i| {
-        data[i] = r.float(f32) * 10 - 5;
-        query[i] = r.float(f32);
-    }
-
-    const compressed = encode(std.testing.allocator, data[0..dim], .{ .seed = seed }) catch unreachable;
-    defer std.testing.allocator.free(compressed);
-
-    var checksum: f32 = 0;
-    for (0..iterations) |_| {
-        checksum += dot(query[0..dim], compressed, seed);
-    }
-    std.debug.print("profile dot 512 checksum: {e}\n", .{checksum});
-}
-
-test "profile dot 1024" {
-    const dim: usize = 1024;
-    const iterations: usize = 500;
-    const seed: u32 = 12345;
-
-    var data: [4096]f32 = undefined;
-    var query: [4096]f32 = undefined;
-    var rng = std.Random.DefaultPrng.init(seed);
-    const r = rng.random();
-    for (0..dim) |i| {
-        data[i] = r.float(f32) * 10 - 5;
-        query[i] = r.float(f32);
-    }
-
-    const compressed = encode(std.testing.allocator, data[0..dim], .{ .seed = seed }) catch unreachable;
-    defer std.testing.allocator.free(compressed);
-
-    var checksum: f32 = 0;
-    for (0..iterations) |_| {
-        checksum += dot(query[0..dim], compressed, seed);
-    }
-    std.debug.print("profile dot 1024 checksum: {e}\n", .{checksum});
-}
-
-test "profile decode 512" {
-    const dim: usize = 512;
-    const iterations: usize = 100;
-    const seed: u32 = 12345;
-
-    var data: [4096]f32 = undefined;
-    var rng = std.Random.DefaultPrng.init(seed);
-    const r = rng.random();
-    for (0..dim) |i| {
-        data[i] = r.float(f32) * 10 - 5;
-    }
-
-    const compressed = encode(std.testing.allocator, data[0..dim], .{ .seed = seed }) catch unreachable;
-    defer std.testing.allocator.free(compressed);
-
-    var checksum: f32 = 0;
-    for (0..iterations) |_| {
-        const decoded = decode(std.testing.allocator, compressed, seed) catch unreachable;
-        for (decoded) |v| checksum += v;
-        std.testing.allocator.free(decoded);
-    }
-    std.debug.print("profile decode 512 checksum: {e}\n", .{checksum});
-}
-
-pub const PreparedTurboQuant = struct {
-    dim: usize,
-    seed: u32,
-    rot_op: rotation.RotationOperator,
-    qjl_workspace: qjl.Workspace,
-    scratch_rotated: []f32,
-    scratch_residual: []f32,
-
-    pub fn prepare(allocator: std.mem.Allocator, dim: usize, seed: u32) !PreparedTurboQuant {
-        var rot_op = try rotation.RotationOperator.prepare(allocator, dim, seed);
-        errdefer rot_op.destroy(allocator);
-
-        var qjl_workspace = try qjl.Workspace.init(allocator, dim);
-        errdefer qjl_workspace.deinit(allocator);
-
-        const scratch_rotated = try allocator.alloc(f32, dim);
-        errdefer allocator.free(scratch_rotated);
-
-        const scratch_residual = try allocator.alloc(f32, dim);
-        errdefer allocator.free(scratch_residual);
-
-        return .{
-            .dim = dim,
-            .seed = seed,
-            .rot_op = rot_op,
-            .qjl_workspace = qjl_workspace,
-            .scratch_rotated = scratch_rotated,
-            .scratch_residual = scratch_residual,
-        };
-    }
-
-    pub fn destroy(ptq: *PreparedTurboQuant, allocator: std.mem.Allocator) void {
-        ptq.rot_op.destroy(allocator);
-        ptq.qjl_workspace.deinit(allocator);
-        allocator.free(ptq.scratch_rotated);
-        allocator.free(ptq.scratch_residual);
-    }
-
-    pub fn encode(ptq: *PreparedTurboQuant, allocator: std.mem.Allocator, x: []const f32) ![]u8 {
-        const dim = ptq.dim;
-
-        ptq.rot_op.rotate(x, ptq.scratch_rotated);
-
-        var max_r: f32 = 0;
-        for (0..dim / 2) |i| {
-            const r = math.norm(ptq.scratch_rotated[i * 2 .. i * 2 + 2]);
-            if (r > max_r) max_r = r;
-        }
-        if (max_r == 0) max_r = 1.0;
-
-        const polar_encoded = try polar.encode(allocator, ptq.scratch_rotated, max_r);
-        errdefer allocator.free(polar_encoded);
-
-        computeResidualFromPolar(polar_encoded, ptq.scratch_rotated, max_r, ptq.scratch_residual);
-
-        const gamma = math.norm(ptq.scratch_residual);
-        const qjl_encoded = try qjl.encodeWithWorkspace(allocator, ptq.scratch_residual, &ptq.rot_op, &ptq.qjl_workspace);
-        errdefer allocator.free(qjl_encoded);
-
-        const polar_bytes = @as(u32, @intCast(polar_encoded.len));
-        const qjl_bytes = @as(u32, @intCast(qjl_encoded.len));
-        const total_size = format.HEADER_SIZE + polar_encoded.len + qjl_encoded.len;
-
-        const result = try allocator.alloc(u8, total_size);
-        errdefer allocator.free(result);
-
-        format.writeHeader(result, @intCast(dim), polar_bytes, qjl_bytes, max_r, gamma);
-        @memcpy(result[format.HEADER_SIZE..][0..polar_encoded.len], polar_encoded);
-        @memcpy(result[format.HEADER_SIZE + polar_encoded.len ..], qjl_encoded);
-        allocator.free(polar_encoded);
-        allocator.free(qjl_encoded);
-
-        return result;
-    }
-
-    pub fn decode(ptq: *PreparedTurboQuant, allocator: std.mem.Allocator, compressed: []const u8) ![]f32 {
-        const header = try format.readHeader(compressed);
-        const payload = try format.slicePayload(compressed, header);
-
-        const polar_decoded = try polar.decode(allocator, payload.polar, header.dim, header.max_r);
-        errdefer allocator.free(polar_decoded);
-
-        const qjl_decoded = try allocator.alloc(f32, header.dim);
-        errdefer allocator.free(qjl_decoded);
-        qjl.decodeInto(qjl_decoded, payload.qjl, header.gamma, &ptq.rot_op, &ptq.qjl_workspace);
-
-        for (polar_decoded, qjl_decoded) |*p, q| {
-            p.* += q;
-        }
-        allocator.free(qjl_decoded);
-
-        return polar_decoded;
-    }
-
-    pub fn dot(ptq: *PreparedTurboQuant, q: []const f32, compressed: []const u8) f32 {
-        const header = format.readHeader(compressed) catch return 0;
-        if (q.len != header.dim) return 0;
-
-        const payload = format.slicePayload(compressed, header) catch return 0;
-
-        const polar_sum = polar.dotProduct(q, payload.polar, header.max_r);
-        const qjl_sum = qjl.estimateDotWithWorkspace(q, payload.qjl, header.gamma, &ptq.rot_op, &ptq.qjl_workspace);
-
-        return polar_sum + qjl_sum;
-    }
-};

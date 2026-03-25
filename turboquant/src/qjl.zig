@@ -1,5 +1,6 @@
 const std = @import("std");
 const rotation = @import("rotation.zig");
+const math = @import("math.zig");
 
 pub const QjlError = error{ InvalidDimension, OutOfMemory };
 
@@ -156,12 +157,12 @@ pub fn estimateDotWithWorkspace(
 
     rot_op.matVecMul(q, workspace.projected);
 
-    var dot_sum: f32 = 0;
     for (0..d) |i| {
         const bit = (qjl_bits[i / 8] >> @intCast(i % 8)) & 1;
-        const sign: f32 = if (bit == 1) 1.0 else -1.0;
-        dot_sum += workspace.projected[i] * sign;
+        workspace.sign_vec[i] = if (bit == 1) 1.0 else -1.0;
     }
+
+    const dot_sum = math.dot(workspace.projected, workspace.sign_vec);
 
     const scale = SQRT_PI_OVER_2 / @as(f32, @floatFromInt(d)) * gamma;
     return dot_sum * scale;
