@@ -64,12 +64,15 @@ fn generateVector(allocator: std.mem.Allocator, dim: usize, seed: u32) ![]f32 {
 }
 
 fn runEncode(allocator: std.mem.Allocator, dim: usize, iterations: usize, seed: u32) !f32 {
+    var engine = try turboquant.Engine.init(allocator, .{ .dim = dim, .seed = seed });
+    defer engine.deinit(allocator);
+
     const data = try generateVector(allocator, dim, seed);
     defer allocator.free(data);
 
     var checksum: f32 = 0;
     for (0..iterations) |_| {
-        const compressed = try turboquant.encode(allocator, data, .{ .seed = seed });
+        const compressed = try engine.encode(allocator, data);
         for (compressed) |b| {
             checksum += @as(f32, @floatFromInt(b));
         }
@@ -79,15 +82,18 @@ fn runEncode(allocator: std.mem.Allocator, dim: usize, iterations: usize, seed: 
 }
 
 fn runDecode(allocator: std.mem.Allocator, dim: usize, iterations: usize, seed: u32) !f32 {
+    var engine = try turboquant.Engine.init(allocator, .{ .dim = dim, .seed = seed });
+    defer engine.deinit(allocator);
+
     const data = try generateVector(allocator, dim, seed);
     defer allocator.free(data);
 
-    const compressed = try turboquant.encode(allocator, data, .{ .seed = seed });
+    const compressed = try engine.encode(allocator, data);
     defer allocator.free(compressed);
 
     var checksum: f32 = 0;
     for (0..iterations) |_| {
-        const decoded = try turboquant.decode(allocator, compressed, seed);
+        const decoded = try engine.decode(allocator, compressed);
         for (decoded) |v| {
             checksum += v;
         }
@@ -97,18 +103,21 @@ fn runDecode(allocator: std.mem.Allocator, dim: usize, iterations: usize, seed: 
 }
 
 fn runDot(allocator: std.mem.Allocator, dim: usize, iterations: usize, seed: u32) !f32 {
+    var engine = try turboquant.Engine.init(allocator, .{ .dim = dim, .seed = seed });
+    defer engine.deinit(allocator);
+
     const data = try generateVector(allocator, dim, seed);
     defer allocator.free(data);
 
     const query = try generateVector(allocator, dim, seed + 1);
     defer allocator.free(query);
 
-    const compressed = try turboquant.encode(allocator, data, .{ .seed = seed });
+    const compressed = try engine.encode(allocator, data);
     defer allocator.free(compressed);
 
     var checksum: f32 = 0;
     for (0..iterations) |_| {
-        checksum += turboquant.dot(query, compressed, seed);
+        checksum += engine.dot(query, compressed);
     }
     return checksum;
 }

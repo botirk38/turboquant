@@ -10,13 +10,12 @@ const qjl = @import("qjl.zig");
 pub const EncodeError = error{ InvalidDimension, OutOfMemory };
 pub const DecodeError = error{ InvalidHeader, InvalidPayload, OutOfMemory };
 
-pub const DEFAULT_SEED: u32 = 12345;
-
-pub const Options = struct {
-    seed: u32 = DEFAULT_SEED,
+pub const EngineConfig = struct {
+    dim: usize,
+    seed: u32,
 };
 
-const Engine = struct {
+pub const Engine = struct {
     dim: usize,
     seed: u32,
     rot_op: rotation.RotationOperator,
@@ -26,8 +25,11 @@ const Engine = struct {
     scratch_polar_decoded: []f32,
     scratch_qjl_decoded: []f32,
 
-    fn init(allocator: std.mem.Allocator, dim: usize, seed: u32) !Engine {
-        var rot_op = try rotation.RotationOperator.prepare(allocator, dim, seed);
+    pub fn init(allocator: std.mem.Allocator, config: EngineConfig) !Engine {
+        const dim = config.dim;
+        if (dim == 0 or dim % 2 != 0) return EncodeError.InvalidDimension;
+
+        var rot_op = try rotation.RotationOperator.prepare(allocator, dim, config.seed);
         errdefer rot_op.destroy(allocator);
 
         var qjl_workspace = try qjl.Workspace.init(allocator, dim);
@@ -47,7 +49,7 @@ const Engine = struct {
 
         return .{
             .dim = dim,
-            .seed = seed,
+            .seed = config.seed,
             .rot_op = rot_op,
             .qjl_workspace = qjl_workspace,
             .scratch_rotated = scratch_rotated,
@@ -57,7 +59,7 @@ const Engine = struct {
         };
     }
 
-    fn deinit(e: *Engine, allocator: std.mem.Allocator) void {
+    pub fn deinit(e: *Engine, allocator: std.mem.Allocator) void {
         e.rot_op.destroy(allocator);
         e.qjl_workspace.deinit(allocator);
         allocator.free(e.scratch_rotated);
@@ -67,8 +69,9 @@ const Engine = struct {
         e.* = undefined;
     }
 
-    fn encode(e: *Engine, allocator: std.mem.Allocator, x: []const f32) ![]u8 {
+    pub fn encode(e: *Engine, allocator: std.mem.Allocator, x: []const f32) ![]u8 {
         const dim = e.dim;
+        if (x.len != dim) return EncodeError.InvalidDimension;
 
         e.rot_op.rotate(x, e.scratch_rotated);
 
@@ -101,14 +104,31 @@ const Engine = struct {
         allocator.free(polar_encoded);
         allocator.free(qjl_encoded);
 
+        const bpd = (total_size - format.HEADER_SIZE) * 8 / dim;
+        log.debug("encoded: dim={}, bytes={}, bits/dim={}", .{ dim, total_size, bpd });
+
         return result;
     }
 
-    fn decode(e: *Engine, allocator: std.mem.Allocator, compressed: []const u8) ![]f32 {
-        const header = try format.readHeader(compressed);
-        const payload = try format.slicePayload(compressed, header);
+    pub fn decode(e: *Engine, allocator: std.mem.Allocator, compressed: []const u8) ![]f32 {
+        const header = format.readHeader(compressed) catch |err| switch (err) {
+            error.InvalidHeader => return DecodeError.InvalidHeader,
+            error.OutOfMemory => return DecodeError.OutOfMemory,
+            error.InvalidPayload => return DecodeError.InvalidPayload,
+        };
+        const dim = e.dim;
+        if (header.dim != dim) return DecodeError.InvalidPayload;
 
-        const polar_decoded = try polar.decode(allocator, payload.polar, header.dim, header.max_r);
+        const payload = format.slicePayload(compressed, header) catch |err| switch (err) {
+            error.InvalidHeader => return DecodeError.InvalidHeader,
+            error.OutOfMemory => return DecodeError.OutOfMemory,
+            error.InvalidPayload => return DecodeError.InvalidPayload,
+        };
+
+        const polar_decoded = polar.decode(allocator, payload.polar, dim, header.max_r) catch |err| switch (err) {
+            error.InvalidDimension => return DecodeError.InvalidPayload,
+            error.OutOfMemory => return DecodeError.OutOfMemory,
+        };
         errdefer allocator.free(polar_decoded);
 
         qjl.decodeInto(e.scratch_qjl_decoded, payload.qjl, header.gamma, &e.rot_op, &e.qjl_workspace);
@@ -118,9 +138,9 @@ const Engine = struct {
         return polar_decoded;
     }
 
-    fn dot(e: *Engine, q: []const f32, compressed: []const u8) f32 {
+    pub fn dot(e: *Engine, q: []const f32, compressed: []const u8) f32 {
         const header = format.readHeader(compressed) catch return 0;
-        if (q.len != header.dim) return 0;
+        if (q.len != e.dim or header.dim != e.dim) return 0;
 
         const payload = format.slicePayload(compressed, header) catch return 0;
 
@@ -130,69 +150,6 @@ const Engine = struct {
         return polar_sum + qjl_sum;
     }
 };
-
-pub fn encode(allocator: std.mem.Allocator, x: []const f32, opts: Options) EncodeError![]u8 {
-    const dim = x.len;
-    if (dim == 0 or dim % 2 != 0) return EncodeError.InvalidDimension;
-
-    var engine = try Engine.init(allocator, dim, opts.seed);
-    defer engine.deinit(allocator);
-
-    const result = try engine.encode(allocator, x);
-    const bpd = (result.len - format.HEADER_SIZE) * 8 / dim;
-    log.debug("encoded: dim={}, bytes={}, bits/dim={}", .{ dim, result.len, bpd });
-
-    return result;
-}
-
-pub fn decode(allocator: std.mem.Allocator, compressed: []const u8, seed: u32) DecodeError![]f32 {
-    const header = format.readHeader(compressed) catch |err| switch (err) {
-        error.InvalidHeader => return DecodeError.InvalidHeader,
-        error.OutOfMemory => return DecodeError.OutOfMemory,
-        error.InvalidPayload => return DecodeError.InvalidPayload,
-    };
-    const dim = header.dim;
-
-    const payload = format.slicePayload(compressed, header) catch |err| switch (err) {
-        error.InvalidHeader => return DecodeError.InvalidHeader,
-        error.OutOfMemory => return DecodeError.OutOfMemory,
-        error.InvalidPayload => return DecodeError.InvalidPayload,
-    };
-
-    var engine = Engine.init(allocator, dim, seed) catch |err| switch (err) {
-        error.OutOfMemory => return DecodeError.OutOfMemory,
-    };
-    errdefer engine.deinit(allocator);
-
-    const polar_decoded = polar.decode(allocator, payload.polar, dim, header.max_r) catch |err| switch (err) {
-        error.InvalidDimension => return DecodeError.InvalidPayload,
-        error.OutOfMemory => return DecodeError.OutOfMemory,
-    };
-    errdefer allocator.free(polar_decoded);
-
-    qjl.decodeInto(engine.scratch_qjl_decoded, payload.qjl, header.gamma, &engine.rot_op, &engine.qjl_workspace);
-
-    math.addInPlace(polar_decoded, engine.scratch_qjl_decoded);
-
-    return polar_decoded;
-}
-
-pub fn dot(q: []const f32, compressed: []const u8, seed: u32) f32 {
-    const header = format.readHeader(compressed) catch return 0;
-    const dim = header.dim;
-
-    if (q.len != dim) return 0;
-
-    const payload = format.slicePayload(compressed, header) catch return 0;
-
-    var engine = Engine.init(std.heap.page_allocator, dim, seed) catch return 0;
-    defer engine.deinit(std.heap.page_allocator);
-
-    const polar_sum = polar.dotProduct(q, payload.polar, header.max_r);
-    const qjl_sum = qjl.estimateDotWithWorkspace(q, payload.qjl, header.gamma, &engine.rot_op, &engine.qjl_workspace);
-
-    return polar_sum + qjl_sum;
-}
 
 fn computeResidualFromPolar(polar_encoded: []const u8, rotated: []const f32, max_r: f32, residual: []f32) void {
     const dim = rotated.len;
@@ -223,37 +180,49 @@ fn computeResidualFromPolar(polar_encoded: []const u8, rotated: []const f32, max
 
 test "roundtrip" {
     const allocator = std.testing.allocator;
+    const seed: u32 = 12345;
+    const dim: usize = 8;
+
+    var engine = try Engine.init(allocator, .{ .dim = dim, .seed = seed });
+    defer engine.deinit(allocator);
+
     const x: [8]f32 = .{ 1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0 };
     const q: [8]f32 = .{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
 
     var true_dot: f32 = 0;
     for (x, q) |xv, qv| true_dot += xv * qv;
 
-    const compressed = try encode(allocator, &x, .{});
+    const compressed = try engine.encode(allocator, &x);
     defer allocator.free(compressed);
 
-    log.info("{} bytes ({} bits/dim)", .{ compressed.len, (compressed.len - format.HEADER_SIZE) * 8 / x.len });
+    log.info("{} bytes ({} bits/dim)", .{ compressed.len, (compressed.len - format.HEADER_SIZE) * 8 / dim });
 
-    const decoded = try decode(allocator, compressed, DEFAULT_SEED);
+    const decoded = try engine.decode(allocator, compressed);
     defer allocator.free(decoded);
 
     var decoded_dot: f32 = 0;
     for (decoded, q) |dv, qv| decoded_dot += dv * qv;
 
-    const cdot = dot(&q, compressed, DEFAULT_SEED);
+    const cdot = engine.dot(&q, compressed);
     log.info("true={e}, decoded_dot={e}, direct_dot={e}", .{ true_dot, decoded_dot, cdot });
     try std.testing.expect(@abs(true_dot - cdot) < 50.0);
 }
 
 test "compression ratio" {
     const allocator = std.testing.allocator;
+    const seed: u32 = 12345;
+    const dim: usize = 128;
+
+    var engine = try Engine.init(allocator, .{ .dim = dim, .seed = seed });
+    defer engine.deinit(allocator);
+
     var rng = std.Random.DefaultPrng.init(1234);
     const r = rng.random();
 
     var x: [128]f32 = undefined;
     for (&x) |*v| v.* = r.float(f32) * 10 - 5;
 
-    const compressed = try encode(allocator, &x, .{});
+    const compressed = try engine.encode(allocator, &x);
     defer allocator.free(compressed);
 
     const bpd = (compressed.len - format.HEADER_SIZE) * 8 / 128;
@@ -261,58 +230,78 @@ test "compression ratio" {
     try std.testing.expect(bpd <= 4);
 }
 
-test "encode rejects zero dimension" {
+test "init rejects zero dimension" {
     const allocator = std.testing.allocator;
-    const x: [0]f32 = .{};
-    const result = encode(allocator, &x, .{});
+    const result = Engine.init(allocator, .{ .dim = 0, .seed = 12345 });
     try std.testing.expectError(EncodeError.InvalidDimension, result);
 }
 
-test "encode rejects odd dimension" {
+test "init rejects odd dimension" {
     const allocator = std.testing.allocator;
-    const x: [7]f32 = .{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0 };
-    const result = encode(allocator, &x, .{});
+    const result = Engine.init(allocator, .{ .dim = 7, .seed = 12345 });
+    try std.testing.expectError(EncodeError.InvalidDimension, result);
+}
+
+test "encode rejects wrong dimension" {
+    const allocator = std.testing.allocator;
+    var engine = try Engine.init(allocator, .{ .dim = 8, .seed = 12345 });
+    defer engine.deinit(allocator);
+
+    const x: [16]f32 = .{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0 };
+    const result = engine.encode(allocator, &x);
     try std.testing.expectError(EncodeError.InvalidDimension, result);
 }
 
 test "decode rejects truncated header" {
     const allocator = std.testing.allocator;
+    var engine = try Engine.init(allocator, .{ .dim = 128, .seed = 12345 });
+    defer engine.deinit(allocator);
+
     const short: [5]u8 = .{ 1, 0, 0, 0, 0 };
-    const result = decode(allocator, &short, DEFAULT_SEED);
+    const result = engine.decode(allocator, &short);
     try std.testing.expectError(DecodeError.InvalidHeader, result);
 }
 
 test "decode rejects truncated payload" {
     const allocator = std.testing.allocator;
+    var engine = try Engine.init(allocator, .{ .dim = 128, .seed = 12345 });
+    defer engine.deinit(allocator);
+
     var buf: [118]u8 = undefined;
     format.writeHeader(&buf, 128, 1000, 100, 1.0, 0.5);
-    const result = decode(allocator, &buf, DEFAULT_SEED);
+    const result = engine.decode(allocator, &buf);
     try std.testing.expectError(DecodeError.InvalidPayload, result);
 }
 
 test "dot returns zero on dimension mismatch" {
     const allocator = std.testing.allocator;
+    var engine = try Engine.init(allocator, .{ .dim = 8, .seed = 12345 });
+    defer engine.deinit(allocator);
+
     const x: [8]f32 = .{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
-    const compressed = try encode(allocator, &x, .{});
+    const compressed = try engine.encode(allocator, &x);
     defer allocator.free(compressed);
 
     const wrong_dim: [16]f32 = .{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0 };
-    const result = dot(&wrong_dim, compressed, DEFAULT_SEED);
+    const result = engine.dot(&wrong_dim, compressed);
     try std.testing.expectEqual(0.0, result);
 }
 
 test "roundtrip correct length and finite" {
     const allocator = std.testing.allocator;
+    var engine = try Engine.init(allocator, .{ .dim = 64, .seed = 9999 });
+    defer engine.deinit(allocator);
+
     var rng = std.Random.DefaultPrng.init(9999);
     const r = rng.random();
 
     var x: [64]f32 = undefined;
     for (&x) |*v| v.* = r.float(f32) * 10 - 5;
 
-    const compressed = try encode(allocator, &x, .{});
+    const compressed = try engine.encode(allocator, &x);
     defer allocator.free(compressed);
 
-    const decoded = try decode(allocator, compressed, DEFAULT_SEED);
+    const decoded = try engine.decode(allocator, compressed);
     defer allocator.free(decoded);
 
     try std.testing.expectEqual(x.len, decoded.len);
@@ -323,19 +312,24 @@ test "roundtrip correct length and finite" {
 
 test "roundtrip multiple dims" {
     const allocator = std.testing.allocator;
-    var rng = std.Random.DefaultPrng.init(8888);
-    const r = rng.random();
+    const seed: u32 = 8888;
 
     const dims = [_]usize{ 8, 16, 32, 64, 128 };
 
     for (dims) |dim| {
+        var engine = try Engine.init(allocator, .{ .dim = dim, .seed = seed });
+        defer engine.deinit(allocator);
+
+        var rng = std.Random.DefaultPrng.init(seed);
+        const r = rng.random();
+
         var x: [128]f32 = undefined;
         for (0..dim) |i| x[i] = r.float(f32) * 10 - 5;
 
-        const compressed = try encode(allocator, x[0..dim], .{});
+        const compressed = try engine.encode(allocator, x[0..dim]);
         defer allocator.free(compressed);
 
-        const decoded = try decode(allocator, compressed, DEFAULT_SEED);
+        const decoded = try engine.decode(allocator, compressed);
         defer allocator.free(decoded);
 
         try std.testing.expectEqual(dim, decoded.len);
@@ -344,6 +338,9 @@ test "roundtrip multiple dims" {
 
 test "dot close to decoded dot" {
     const allocator = std.testing.allocator;
+    var engine = try Engine.init(allocator, .{ .dim = 64, .seed = 7777 });
+    defer engine.deinit(allocator);
+
     var rng = std.Random.DefaultPrng.init(7777);
     const r = rng.random();
 
@@ -353,16 +350,16 @@ test "dot close to decoded dot" {
     var q: [64]f32 = undefined;
     for (&q) |*v| v.* = r.float(f32);
 
-    const compressed = try encode(allocator, &x, .{});
+    const compressed = try engine.encode(allocator, &x);
     defer allocator.free(compressed);
 
-    const decoded = try decode(allocator, compressed, DEFAULT_SEED);
+    const decoded = try engine.decode(allocator, compressed);
     defer allocator.free(decoded);
 
     var decoded_dot: f32 = 0;
     for (decoded, q) |dv, qv| decoded_dot += dv * qv;
 
-    const direct_dot = dot(&q, compressed, DEFAULT_SEED);
+    const direct_dot = engine.dot(&q, compressed);
 
     const rel_err = @abs(decoded_dot - direct_dot) / (@abs(decoded_dot) + 1e-10);
     log.info("decoded_dot={e}, direct_dot={e}, rel_err={e}", .{ decoded_dot, direct_dot, rel_err });
@@ -374,6 +371,9 @@ test "benchmark encode" {
     const seed: u32 = 12345;
 
     for (dims) |dim| {
+        var engine = try Engine.init(std.testing.allocator, .{ .dim = dim, .seed = seed });
+        defer engine.deinit(std.testing.allocator);
+
         var data: [1024]f32 = undefined;
         var rng = std.Random.DefaultPrng.init(seed);
         const r = rng.random();
@@ -384,7 +384,7 @@ test "benchmark encode" {
         var timer = std.time.Timer.start() catch unreachable;
         const iterations = 100;
         for (0..iterations) |_| {
-            const compressed = encode(std.testing.allocator, data[0..dim], .{ .seed = seed }) catch unreachable;
+            const compressed = engine.encode(std.testing.allocator, data[0..dim]) catch unreachable;
             std.testing.allocator.free(compressed);
         }
         const ns = timer.read();
@@ -399,6 +399,9 @@ test "benchmark decode" {
     const seed: u32 = 12345;
 
     for (dims) |dim| {
+        var engine = try Engine.init(std.testing.allocator, .{ .dim = dim, .seed = seed });
+        defer engine.deinit(std.testing.allocator);
+
         var data: [1024]f32 = undefined;
         var rng = std.Random.DefaultPrng.init(seed);
         const r = rng.random();
@@ -406,13 +409,13 @@ test "benchmark decode" {
             data[i] = r.float(f32) * 10 - 5;
         }
 
-        const compressed = encode(std.testing.allocator, data[0..dim], .{ .seed = seed }) catch unreachable;
+        const compressed = try engine.encode(std.testing.allocator, data[0..dim]);
         defer std.testing.allocator.free(compressed);
 
         var timer = std.time.Timer.start() catch unreachable;
         const iterations = 100;
         for (0..iterations) |_| {
-            const decoded = decode(std.testing.allocator, compressed, seed) catch unreachable;
+            const decoded = engine.decode(std.testing.allocator, compressed) catch unreachable;
             std.testing.allocator.free(decoded);
         }
         const ns = timer.read();
@@ -426,6 +429,9 @@ test "benchmark dot" {
     const seed: u32 = 12345;
 
     for (dims) |dim| {
+        var engine = try Engine.init(std.testing.allocator, .{ .dim = dim, .seed = seed });
+        defer engine.deinit(std.testing.allocator);
+
         var data: [1024]f32 = undefined;
         var query: [1024]f32 = undefined;
         var rng = std.Random.DefaultPrng.init(seed);
@@ -435,13 +441,13 @@ test "benchmark dot" {
             query[i] = r.float(f32);
         }
 
-        const compressed = encode(std.testing.allocator, data[0..dim], .{ .seed = seed }) catch unreachable;
+        const compressed = try engine.encode(std.testing.allocator, data[0..dim]);
         defer std.testing.allocator.free(compressed);
 
         var timer = std.time.Timer.start() catch unreachable;
         const iterations = 100;
         for (0..iterations) |_| {
-            _ = dot(query[0..dim], compressed, seed);
+            _ = engine.dot(query[0..dim], compressed);
         }
         const ns = timer.read();
         const ns_per_op = ns / iterations;
@@ -454,6 +460,9 @@ test "benchmark dot decoded" {
     const seed: u32 = 12345;
 
     for (dims) |dim| {
+        var engine = try Engine.init(std.testing.allocator, .{ .dim = dim, .seed = seed });
+        defer engine.deinit(std.testing.allocator);
+
         var data: [1024]f32 = undefined;
         var query: [1024]f32 = undefined;
         var rng = std.Random.DefaultPrng.init(seed);
@@ -463,13 +472,13 @@ test "benchmark dot decoded" {
             query[i] = r.float(f32);
         }
 
-        const compressed = encode(std.testing.allocator, data[0..dim], .{ .seed = seed }) catch unreachable;
+        const compressed = try engine.encode(std.testing.allocator, data[0..dim]);
         defer std.testing.allocator.free(compressed);
 
         var timer = std.time.Timer.start() catch unreachable;
         const iterations = 100;
         for (0..iterations) |_| {
-            const decoded = decode(std.testing.allocator, compressed, seed) catch unreachable;
+            const decoded = engine.decode(std.testing.allocator, compressed) catch unreachable;
             var dot_prod: f32 = 0;
             for (0..dim) |i| {
                 dot_prod += decoded[i] * query[i];
@@ -491,6 +500,9 @@ test "benchmark compression" {
     std.debug.print("------|----------|----------|----------|----------|----------\n", .{});
 
     for (dims) |dim| {
+        var engine = try Engine.init(std.testing.allocator, .{ .dim = dim, .seed = seed });
+        defer engine.deinit(std.testing.allocator);
+
         var data: [4096]f32 = undefined;
         var rng = std.Random.DefaultPrng.init(seed);
         const r = rng.random();
@@ -498,7 +510,7 @@ test "benchmark compression" {
             data[i] = r.float(f32) * 10 - 5;
         }
 
-        const compressed = encode(std.testing.allocator, data[0..dim], .{ .seed = seed }) catch unreachable;
+        const compressed = try engine.encode(std.testing.allocator, data[0..dim]);
         defer std.testing.allocator.free(compressed);
 
         const raw_bytes = dim * 4;
@@ -519,6 +531,9 @@ test "compression breakdown" {
     std.debug.print("\n=== COMPRESSION BREAKDOWN ===\n", .{});
 
     for (dims) |dim| {
+        var engine = try Engine.init(std.testing.allocator, .{ .dim = dim, .seed = seed });
+        defer engine.deinit(std.testing.allocator);
+
         var data: [4096]f32 = undefined;
         var rng = std.Random.DefaultPrng.init(seed);
         const r = rng.random();
@@ -526,7 +541,7 @@ test "compression breakdown" {
             data[i] = r.float(f32) * 10 - 5;
         }
 
-        const compressed = encode(std.testing.allocator, data[0..dim], .{ .seed = seed }) catch unreachable;
+        const compressed = try engine.encode(std.testing.allocator, data[0..dim]);
         defer std.testing.allocator.free(compressed);
 
         const header = format.HEADER_SIZE;
