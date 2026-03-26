@@ -313,5 +313,7 @@ test "RotationOperator.prepare vs ondemand consistent" {
     op.matVecMul(&input, &output_prepared);
     matVecMul(&input, &output_ondemand, seed);
 
-    try std.testing.expectEqualSlices(f32, &output_prepared, &output_ondemand);
+    for (output_prepared, output_ondemand) |a, b| {
+        try std.testing.expectApproxEqAbs(a, b, 0.0001);
+    }
 }

@@ -5,6 +5,12 @@ zig-out/
 *.o
 *.a
 
+# Nested Zig builds (turboquant package)
+turboquant/.zig-cache/
+turboquant/zig-out/
+turboquant/*.o
+turboquant/*.a
+
 # Build artifacts
 profile
 qjl
@@ -13,3 +19,9 @@ qjl
 
 # OS
 .DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
