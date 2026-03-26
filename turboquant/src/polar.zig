@@ -58,6 +58,16 @@ inline fn unpackOne(compressed: []const u8, bit_pos: usize) struct { r: f32, buc
     return .{ .r = r, .bucket = bucket };
 }
 
+pub inline fn reconstructPair(compressed: []const u8, bit_pos: usize, max_r: f32) struct { dx: f32, dy: f32 } {
+    const unpacked = unpackOne(compressed, bit_pos);
+    const r = unpacked.r * max_r;
+    const bucket = unpacked.bucket;
+    return .{
+        .dx = r * polar_cos_table[bucket],
+        .dy = r * polar_sin_table[bucket],
+    };
+}
+
 pub fn encode(
     allocator: std.mem.Allocator,
     rotated: []const f32,
@@ -107,14 +117,11 @@ pub fn decodeInto(
     var bit_pos: usize = 0;
 
     for (0..num_pairs) |i| {
-        const unpacked = unpackOne(compressed, bit_pos);
+        const pair = reconstructPair(compressed, bit_pos, max_r);
         bit_pos += BITS_PER_PAIR;
 
-        const r = unpacked.r * max_r;
-        const bucket = unpacked.bucket;
-
-        out[i * 2] = r * polar_cos_table[bucket];
-        out[i * 2 + 1] = r * polar_sin_table[bucket];
+        out[i * 2] = pair.dx;
+        out[i * 2 + 1] = pair.dy;
     }
 }
 
@@ -131,16 +138,10 @@ pub fn dotProduct(
     var bit_pos: usize = 0;
 
     for (0..num_pairs) |i| {
-        const unpacked = unpackOne(compressed, bit_pos);
+        const pair = reconstructPair(compressed, bit_pos, max_r);
         bit_pos += BITS_PER_PAIR;
 
-        const r = unpacked.r * max_r;
-        const bucket = unpacked.bucket;
-
-        const dx = r * polar_cos_table[bucket];
-        const dy = r * polar_sin_table[bucket];
-
-        sum += q[i * 2] * dx + q[i * 2 + 1] * dy;
+        sum += q[i * 2] * pair.dx + q[i * 2 + 1] * pair.dy;
     }
 
     return sum;

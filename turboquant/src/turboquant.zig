@@ -157,26 +157,13 @@ fn computeResidualFromPolar(polar_encoded: []const u8, rotated: []const f32, max
     const dim = rotated.len;
     const num_pairs = dim / 2;
 
-    const cos_table = polar.cosTable();
-    const sin_table = polar.sinTable();
-
     var bit_pos: usize = 0;
     for (0..num_pairs) |i| {
-        var combined: u7 = 0;
-        for (0..7) |j| {
-            const bit: u7 = @intCast((polar_encoded[(bit_pos + j) / 8] >> @intCast((bit_pos + j) % 8)) & 1);
-            combined = (combined << 1) | bit;
-        }
+        const pair = polar.reconstructPair(polar_encoded, bit_pos, max_r);
         bit_pos += 7;
 
-        const r = @as(f32, @floatFromInt((combined >> 3) & 0xF)) / 15.0 * max_r;
-        const bucket = @as(u3, @intCast(combined & 0x7));
-
-        const dx = r * cos_table[bucket];
-        const dy = r * sin_table[bucket];
-
-        residual[i * 2] = rotated[i * 2] - dx;
-        residual[i * 2 + 1] = rotated[i * 2 + 1] - dy;
+        residual[i * 2] = rotated[i * 2] - pair.dx;
+        residual[i * 2 + 1] = rotated[i * 2 + 1] - pair.dy;
     }
 }
 
