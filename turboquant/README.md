@@ -11,7 +11,24 @@ Add to your `build.zig.zon`:
     .name = "your-project",
     .dependencies = .{
         .turboquant = .{
-            .path = "path/to/turboquant/turboquant",
+            .url = "https://github.com/botirk38/turboquant/archive/refs/tags/v0.1.0.tar.gz",
+            .hash = "sha256-...",
+        },
+    },
+}
+```
+
+To get the hash, run `zig fetch --save https://github.com/botirk38/turboquant/archive/refs/tags/v0.1.0.tar.gz` after adding the URL, and Zig will provide the correct hash.
+
+Or use the latest version from the main branch:
+
+```zig
+.{
+    .name = "your-project",
+    .dependencies = .{
+        .turboquant = .{
+            .url = "https://github.com/botirk38/turboquant/archive/refs/heads/master.tar.gz",
+            .hash = "sha256-...",
         },
     },
 }
@@ -48,13 +65,15 @@ const score = engine.dot(query_vector, compressed);
 
 ## Performance
 
-| Dim | encode | decode | dot |
-|-----|--------|--------|-----|
-| 256 | 189 µs | 84 µs | 73 µs |
-| 512 | 586 µs | 279 µs | 265 µs |
-| 1024 | 2105 µs | 1032 µs | 997 µs |
+![Performance](docs/assets/performance.png)
+
+At dim=1024: encode 2105µs, decode 1032µs, dot 997µs
 
 ## Compression
+
+![Compression Ratio](docs/assets/compression-ratio.png)
+
+![Bits per Dimension](docs/assets/bits-per-dimension.png)
 
 - ~6x compression ratio at dim=1024
 - ~3 bits/dim
@@ -63,7 +82,7 @@ const score = engine.dot(query_vector, compressed);
 
 ```bash
 cd turboquant
-zig build-exe -O ReleaseFast -target aarch64-macos-none src/profile.zig
+zig build-exe -O ReleaseFast -target aarch64-macos src/profile.zig
 ```
 
 ## License

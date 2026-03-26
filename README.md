@@ -54,11 +54,7 @@ pub const Engine = struct {
 
 ![Performance](docs/assets/performance.png)
 
-| Dim | encode | decode | dot |
-|-----|--------|--------|-----|
-| 256 | 189 µs | 84 µs | 73 µs |
-| 512 | 586 µs | 279 µs | 265 µs |
-| 1024 | 2105 µs | 1032 µs | 997 µs |
+At dim=1024: encode 2105µs, decode 1032µs, dot 997µs
 
 ## Compression
 

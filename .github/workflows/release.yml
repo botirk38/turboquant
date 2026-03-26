@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: karl-zylinski/zig-action@v1
+        with:
+          version: "0.15.2"
+
+      - name: Format Check
+        working-directory: turboquant
+        run: zig fmt --check src/
+
+      - name: Run Tests
+        working-directory: turboquant
+        run: zig test src/turboquant.zig -target x86_64-linux
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Create tarball
+        run: |
+          cd turboquant
+          tar -czvf ../turboquant-${{ steps.version.outputs.VERSION }}.tar.gz \
+            build.zig \
+            build.zig.zon \
+            src \
+            LICENSE \
+            README.md
+
+      - name: Generate hash
+        id: hash
+        run: |
+          HASH=$(sha256sum turboquant-${{ steps.version.outputs.VERSION }}.tar.gz | cut -d' ' -f1)
+          echo "hash=sha256-$HASH" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ steps.version.outputs.VERSION }}
+          name: Release v${{ steps.version.outputs.VERSION }}
+          files: turboquant-${{ steps.version.outputs.VERSION }}.tar.gz
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
