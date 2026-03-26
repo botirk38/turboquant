@@ -66,7 +66,7 @@ pub const Engine = struct {
 
 ## Star Growth
 
-![Star Growth](docs/assets/star-growth.png)
+[![Star History Chart](https://api.star-history.com/image?repos=botirk38/turboquant&type=Date)](https://star-history.com/#botirk38/turboquant)
 
 ## Building
 
