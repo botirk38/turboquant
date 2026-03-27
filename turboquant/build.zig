@@ -40,7 +40,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(tests).step);
 
     const bench_mod = b.addModule("bench", .{
-        .root_source_file = b.path("src/bench.zig"),
+        .root_source_file = b.path("benchmarks/main.zig"),
         .target = target,
     });
     bench_mod.addImport("turboquant", turboquant_mod);
@@ -50,26 +50,9 @@ pub fn build(b: *std.Build) void {
         .root_module = bench_mod,
     });
 
+    const bench_run = b.addRunArtifact(bench_exe);
+    if (b.args) |args| bench_run.addArgs(args);
+
     const bench_step = b.step("bench", "Run benchmarks");
-    bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
-
-    // Quality benchmark executable
-    const quality_mod = b.createModule(.{
-        .root_source_file = b.path("benchmarks/quality.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    quality_mod.addImport("turboquant", turboquant_mod);
-
-    const quality_exe = b.addExecutable(.{
-        .name = "quality",
-        .root_module = quality_mod,
-    });
-    b.installArtifact(quality_exe);
-
-    const quality_run = b.addRunArtifact(quality_exe);
-    if (b.args) |args| quality_run.addArgs(args);
-
-    const quality_step = b.step("quality", "Run quality benchmarks");
-    quality_step.dependOn(&quality_run.step);
+    bench_step.dependOn(&bench_run.step);
 }
