@@ -1,10 +1,10 @@
 const std = @import("std");
 const log = std.log.scoped(.turboquant);
 
-const format = @import("format.zig");
+pub const format = @import("format.zig");
 const rotation = @import("rotation.zig");
-const math = @import("math.zig");
-const polar = @import("polar.zig");
+pub const math = @import("math.zig");
+pub const polar = @import("polar.zig");
 const qjl = @import("qjl.zig");
 
 pub const EncodeError = error{ InvalidDimension, OutOfMemory };

@@ -40,7 +40,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(tests).step);
 
     const bench_mod = b.addModule("bench", .{
-        .root_source_file = b.path("src/bench.zig"),
+        .root_source_file = b.path("benchmarks/main.zig"),
         .target = target,
     });
     bench_mod.addImport("turboquant", turboquant_mod);
@@ -50,6 +50,9 @@ pub fn build(b: *std.Build) void {
         .root_module = bench_mod,
     });
 
+    const bench_run = b.addRunArtifact(bench_exe);
+    if (b.args) |args| bench_run.addArgs(args);
+
     const bench_step = b.step("bench", "Run benchmarks");
-    bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
+    bench_step.dependOn(&bench_run.step);
 }

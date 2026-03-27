@@ -62,11 +62,32 @@ At dim=1024: encode 2105µs, decode 1032µs, dot 997µs
 
 ![Bits per Dimension](docs/assets/bits-per-dimension.png)
 
+## Quality
+
+![MSE Distortion](docs/assets/mse-distortion.png)
+
+Full (polar+QJL) MSE well below paper's theoretical bound, improving with dimension.
+
+![Recall@k](docs/assets/recall-at-k.png)
+
+Near-perfect recall@10 across all dimensions (N=1000 database, 50 queries).
+
+![Component Analysis](docs/assets/component-analysis.png)
+
+QJL residual encoding reduces MSE by 6-16% over polar-only quantization.
+
+![Dot Product Error](docs/assets/dot-product-error.png)
+
+Inner product distortion decreases with dimension, with QJL consistently outperforming polar-only.
+
 ## Building
 
 ```bash
 cd turboquant
 zig build-exe -O ReleaseFast -target aarch64-macos-none src/profile.zig
+
+# Run quality benchmarks
+zig build quality -- <dim> [N] [k] [num_queries]
 ```
 
 ## Binary Format
