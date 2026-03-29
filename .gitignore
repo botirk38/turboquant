@@ -17,6 +17,13 @@ qjl
 *.trace/
 *.sample.txt
 
+# Python
+*.egg-info/
+__pycache__/
+*.pyc
+python/turboquant/lib/*.dylib
+python/turboquant/lib/*.so
+
 # OS
 .DS_Store
 
