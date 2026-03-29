@@ -39,6 +39,28 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 
+    // Shared library for C/Python bindings (zig build lib)
+    const optimize = b.standardOptimizeOption(.{});
+    const c_api_mod = b.createModule(.{
+        .root_source_file = b.path("src/c_api.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const shared_lib = b.addLibrary(.{
+        .name = "turboquant",
+        .root_module = c_api_mod,
+        .linkage = .dynamic,
+    });
+    shared_lib.linkLibC();
+
+    const install_lib = b.addInstallArtifact(shared_lib, .{});
+    const install_header = b.addInstallFile(b.path("include/turboquant.h"), "include/turboquant.h");
+
+    const lib_step = b.step("lib", "Build shared library for C/Python bindings");
+    lib_step.dependOn(&install_lib.step);
+    lib_step.dependOn(&install_header.step);
+
     const bench_mod = b.addModule("bench", .{
         .root_source_file = b.path("benchmarks/main.zig"),
         .target = target,
